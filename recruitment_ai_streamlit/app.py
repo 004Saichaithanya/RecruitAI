@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import bcrypt
 import re
+import json
 from agents import summarizer, parser, notifier, matcher, shortlister
 
 st.set_page_config(layout="wide")
@@ -37,15 +38,10 @@ def add_user(username, password):
         return False
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    try:
-        c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hash_password(password)))
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:  # Catch integrity error for username conflicts
-        st.error("Username already exists!")
-        return False
-
+    c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hash_password(password)))
+    conn.commit()
+    conn.close()
+    return True
 
 def verify_user(username, password):
     conn = sqlite3.connect('users.db')
@@ -53,11 +49,10 @@ def verify_user(username, password):
     c.execute('SELECT password FROM users WHERE username = ?', (username,))
     result = c.fetchone()
     conn.close()
-    return result and bcrypt.checkpw(password.encode('utf-8'), result[0].encode('utf-8'))
+    return result and bcrypt.checkpw(password.encode(), result[0].encode())
 
 def hash_password(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 # --- App Logic ---
 def login_page():
@@ -68,20 +63,20 @@ def login_page():
 
     if choice == "Login":
         username = st.text_input("Username")
-        password = st.text_input("Password", type="password",  autocomplete="current-password")
+        password = st.text_input("Password", type="password")
 
         if st.button("Login"):
             if verify_user(username, password):
                 st.session_state.logged_in = True
                 st.session_state.username = username
                 st.success("✅ Login successful!")
-                # st.experimental_rerun()  #REMOVE THIS experimental_rerun() CAUSES LOGIN LOOP
+                st.rerun()
             else:
                 st.error("❌ Invalid username or password.")
 
     elif choice == "Sign Up":
         new_user = st.text_input("New Username")
-        new_pass = st.text_input("New Password", type="password",  autocomplete="new-password")
+        new_pass = st.text_input("New Password", type="password")
 
         if st.button("Sign Up"):
             if add_user(new_user, new_pass):
@@ -94,17 +89,16 @@ def home_page():
     # --- JD Upload ---
     st.header("📄 Upload Job Description")
     jd_file = st.file_uploader("Upload JD PDF or Text File", type=["pdf", "txt"])
-    jd_summary = ""
+    if "jd_summary" not in st.session_state:
+        st.session_state.jd_summary = ""
 
     jd_text = ""
     if jd_file is not None:
         try:
             if jd_file.name.endswith(".pdf"):
                 jd_text = parser.extract_text(jd_file)
-            elif jd_file.name.endswith(".txt"):
-                jd_text = parser.extract_txt(jd_file)
             else:
-                st.error("❌ Invalid file format. Please upload a PDF or TXT file.")
+                jd_text = parser.extract_txt(jd_file)
 
             st.subheader("Original JD Text")
             st.text_area("JD", jd_text, height=200)
@@ -119,21 +113,49 @@ def home_page():
             st.error(f"Error processing JD file: {e}")
 
     # --- CV Upload ---
-    st.header("📥 Upload Candidate CVs")
+    #st.set_page_config(page_title="Resume Parser", layout="centered")
+# app.py snippet
+    st.title("📥 Upload Candidate CVs")
     cv_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
-
     parsed_cvs = []
+
     if cv_files:
+        st.markdown("---")
         for file in cv_files:
             try:
-                name, text, skills = parser.parse_cv(file)
-                parsed_cvs.append((name, text, skills))
-                st.markdown(f"**{name}** - Extracted Skills: `{', '.join(skills)}`")
+                name, text, resume_info = parser.parse_cv(file)  # or parser.parse_cv(file) if using a class
+                parsed_cvs.append((name, text, resume_info))
+                st.subheader(f"📄 {name}")
+                
+                # Check if resume_info is a string and try to parse it as JSON
+                if isinstance(resume_info, str):
+                    try:
+                        resume_info = json.loads(resume_info)
+                    except json.JSONDecodeError:
+                        pass  # Keep as string if not valid JSON
+                
+                # Now handle the actual display logic
+                if isinstance(resume_info, dict) and "raw_output" not in resume_info:
+                    for key, value in resume_info.items():
+                        if isinstance(value, list) and value:  # Check if list is not empty
+                            st.markdown(f"**{key}:**")
+                            for item in value:
+                                st.markdown(f"- {item}")
+                        else:
+                            st.markdown(f"**{key}:** {value}")
+                else:
+                    st.markdown("### Raw Output")
+                    if isinstance(resume_info, dict):
+                        st.json(resume_info)  # Use st.json for better formatting
+                    else:
+                        st.code(str(resume_info), language="json")
+                
+                st.markdown("---")
             except Exception as e:
-                st.error(f"Error parsing {file.name}: {e}")
+                st.error(f"❌ Error parsing {file.name}: {e}")
 
     # --- Matching Logic ---
-    if jd_summary and parsed_cvs and st.button("Match Candidates"):
+    if st.session_state.jd_summary and parsed_cvs and st.button("Match Candidates"):
         st.header("🤝 Matching Results")
         matches = matcher.match(jd_summary, parsed_cvs)
         top_candidates = shortlister.shortlist(matches)
@@ -150,13 +172,6 @@ def home_page():
                 st.success("✅ Emails sent successfully!")
             else:
                 st.error("❌ No valid emails provided.")
-
-    # --- Logout Button ---
-    if st.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.username = ""
-        st.experimental_rerun()
-
 
 # --- Main App ---
 def main():
